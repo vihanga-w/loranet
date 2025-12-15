@@ -1,3 +1,6 @@
+import base64
+from dataclasses import dataclass
+import hashlib
 import math
 from random import uniform
 from typing import Optional
@@ -60,6 +63,31 @@ class Node():
         # Weighted quality score
         return margin + (rssi_score * 5.0)
 
+@dataclass
+class Chunk:
+    data: str
+    index: int
+    hash: str
+
+class ChunkedMessage:
+    def __init__(self, size: int):
+        self.size = size
+        self.hashes: list[str] = []
+        self._chunks: list[Chunk] = []
+    
+    def add_chunk(self, data: str, index: int, hash: str):
+        # Dedupe
+        if any(chunk.hash == hash for chunk in self._chunks):
+            return
+        
+        self._chunks.append(Chunk(data, index, hash))
+    
+    def get_data(self):
+        sorted_chunks = sorted(self._chunks, key=lambda c: c.index)
+        full_data = "".join(chunk.data for chunk in sorted_chunks)
+
+        return full_data
+
 class RYLR998:
     def __init__(self, port="/dev/serial0", baudrate=115200, timeout=0.1):
         self._uart = serial.Serial(
@@ -73,6 +101,7 @@ class RYLR998:
         self._lock = threading.RLock()
         self._links: list[Node] = []
         self._pending_messages: list[PendingMessage] = []
+        self._chunked_messages: dict[str, ChunkedMessage] = {}
 
     # Basic Info
 
@@ -231,6 +260,7 @@ class RYLR998:
         for attempt in range(retries):
             # enqueue send
             try:
+                # TODO: Chunk long requests as well
                 self.send(address, frame, guarantee_fulfilment_by=guarantee_fulfilment_by)
             except Exception as e:
                 last_send_err = e
@@ -240,6 +270,46 @@ class RYLR998:
             while self._pending_messages and time.monotonic() < send_deadline:
                 self.fulfill_pending_messages()
                 time.sleep(0.005)
+            
+            chunked_warn = False
+            
+            def process(t: str):
+                parts = t.split("|")
+
+                if msg and len(parts) == 3 and parts[1] == msg_id:
+                    data = parts[2]
+
+                    self.send_now(address, f"AR|{msg_id}".encode("ascii"))
+
+                    return msg_id, data, msg
+                elif msg and len(parts) == 6:
+                    # Chunked message
+                    _, s_chunk_id, index, total_chunks, hash, data = parts
+
+                    self.send_now(address, f"AR|{s_chunk_id}".encode("ascii"))
+
+                    # Calculate chunk id
+                    chunk_id = hashlib.sha1((msg_id + str(index) + str(total_chunks)).encode()).hexdigest()[:8]
+
+                    if chunk_id != s_chunk_id:
+                        return None
+                    elif msg_id not in self._chunked_messages:
+                        # Create chunked msg obj if not exist (arrived before notice)
+                        self._chunked_messages[msg_id] = ChunkedMessage(int(total_chunks))
+                        print("Waiting for a long response, this may take some time")
+                    
+                    self._chunked_messages[msg_id].add_chunk(data, int(index), hash)
+
+                    if len(self._chunked_messages[msg_id]._chunks) == int(total_chunks):
+                        complete_data = self._chunked_messages[msg_id].get_data()
+
+                        return msg_id, complete_data, msg
+
+                    print(len(parts), msg_id, index, total_chunks, chunk_id, s_chunk_id, )
+
+                    return "wait"
+            
+            result = None
 
             # Phase 1: wait briefly for ACK or Response
             got_ack = False
@@ -258,10 +328,19 @@ class RYLR998:
                     break
 
                 if t.startswith("R|"):
-                    parts = t.split("|", 2)
-                    if len(parts) == 3 and parts[1] == msg_id:
-                        self.send_now(address, f"AR|{msg_id}".encode("ascii"))
-                        return msg_id, parts[2].encode("latin-1", errors="ignore"), msg
+                    r = process(t)
+
+                    # Extend deadline by 30s if client informed to wait for chunked
+                    if r == "wait":
+                        deadline1 += 30
+                        continue
+
+                    if not r:
+                        continue
+
+                    result = r
+
+                    break
 
             # Phase 2: if ACK arrived, wait longer for Response
             if got_ack:
@@ -275,10 +354,40 @@ class RYLR998:
 
                     t = msg.data.decode("ascii", errors="ignore")
                     if t.startswith("R|"):
-                        parts = t.split("|", 2)
-                        if len(parts) == 3 and parts[1] == msg_id:
-                            self.send_now(address, f"AR|{msg_id}".encode("ascii"))
-                            return msg_id, parts[2].encode("latin-1", errors="ignore"), msg
+                        r = process(t)
+
+                        # Extend deadline by 30s if client informed to wait for chunked
+                        if r == "wait":
+                            deadline2 += 30
+                            continue
+
+                        if not r:
+                            continue
+
+                        result = r
+
+                        break
+            
+            if result:
+                drain_until = time.monotonic() + 1
+
+                while time.monotonic() < drain_until:
+                    self.fulfill_pending_messages()
+                    m = self.receive()
+                    if not m or not m.data:
+                        time.sleep(0.01)
+                        continue
+
+                    t2 = m.data.decode("ascii", errors="ignore")
+                    if t2.startswith("R|"):
+                        process(t2)  # process() must send AR|... for control+chunks
+                
+                # No longer needed
+                if msg_id in self._chunked_messages:
+                    del self._chunked_messages[msg_id]
+
+                return result
+
 
             # If we got here: no ACK/RESP -> resend with backoff + jitter
             time.sleep(backoff_s * (attempt + 1) + uniform(0, 0.08))

@@ -1,3 +1,6 @@
+import base64
+from math import ceil
+import shlex
 import time
 import json
 import hashlib
@@ -102,6 +105,45 @@ class LoRaGateway:
     def _queue_reliable_response(self, addr: int, msg_id: str, payload_text: str):
         frame = f"R|{msg_id}|{payload_text}".encode("ascii", errors="ignore")
 
+        if len(frame) > 240:
+            # Frame is too large, we need to chunk it
+            # Calculate number of chunks needed
+            # The placeholders here give us enough leeway
+            header_size = len(f"RC|{msg_id}|<chk_idx>|<total>|<hash>|")
+            payload_size = len(payload_text)
+            
+            # We are assuming the header is going to be smaller than the max size
+            max_p_size_per_chunk = 239 - header_size
+
+            chunks = [
+                payload_text[i:i + max_p_size_per_chunk]
+                for i in range(0, payload_size, max_p_size_per_chunk)
+            ]
+
+            chunks_size = len(chunks)
+
+            i = 0
+
+            for chunk in chunks:
+                chunk_id = hashlib.sha1((msg_id + str(i) + str(chunks_size)).encode()).hexdigest()[:8]
+                hash = hashlib.sha1(chunk.encode()).hexdigest()[:8]
+
+                chunk_frame = f"R|{chunk_id}|{i}|{chunks_size}|{hash}|{chunk}".encode("ascii", errors="ignore")
+
+                self._pending_resps[chunk_id] = PendingResp(
+                    addr=addr,
+                    msg_id=chunk_id,
+                    frame=chunk_frame,
+                    next_send_at=time.monotonic(),
+                    attempts=0,
+                    max_attempts=12,
+                    retry_interval_s=0.5,
+                )
+
+                i += 1
+            
+            return
+
         self._pending_resps[msg_id] = PendingResp(
             addr=addr,
             msg_id=msg_id,
@@ -127,17 +169,19 @@ class LoRaGateway:
             if now >= pr.next_send_at:
                 self.lora.send_now(pr.addr, pr.frame)
 
-                # quick RX poll burst (listen for node's ACK)
-                t_end = time.monotonic() + 0.25
-                while time.monotonic() < t_end:
-                    m = self.lora.receive()
-                    if m and m.data:
-                        raw = m.data.decode("ascii", errors="ignore")
-                        if raw == f"AR|{pr.msg_id}":
-                            print(f"[RESP-ACK] from={m.address} id={pr.msg_id}")
-                            done.append(pr.msg_id)
-                            break
-                    time.sleep(0.01)
+                with self.lora._lock:
+                    # quick RX poll burst (listen for node's ACK)
+                    t_end = time.monotonic() + 0.25
+                    while time.monotonic() < t_end:
+                        m = self.lora.receive()
+                        if m and m.data:
+                            raw = m.data.decode("ascii", errors="ignore")
+                            print(raw)
+                            if raw == f"AR|{pr.msg_id}":
+                                print(f"[RESP-ACK] from={m.address} id={pr.msg_id}")
+                                done.append(pr.msg_id)
+                                break
+                        time.sleep(0.01)
                     
                 pr.attempts += 1
                 pr.next_send_at = now + pr.retry_interval_s
@@ -206,9 +250,15 @@ class LoRaGateway:
             self._schedule_send(msg.address, f"A|{msg_id}".encode("ascii"), delay_ms=0)
             print(f"[ACK] to={msg.address} id={msg_id}")
 
+            # Extract arguments
+            argv = shlex.split(payload_str)
+
+            cmd = argv[0]
+            args = argv[1:]
+
             # execute command
             try:
-                res = self.commands.execute(self, payload_str)
+                res = self.commands.execute(self, cmd, args)
             except Exception as e:
                 res = f"ERR {e}"
 
@@ -220,9 +270,12 @@ class LoRaGateway:
             else:
                 res_text = str(res)
 
+            # Encode text as base64
+            b64 = base64.b64encode(res_text.encode("utf-8")).decode()
+
             # queue response reliably (non-blocking)
-            self._queue_reliable_response(msg.address, msg_id, res_text)
-            print(f"[RESP-QUEUED] to={msg.address} id={msg_id} len={len(res_text)}")
+            self._queue_reliable_response(msg.address, msg_id, b64)
+            print(f"[RESP-QUEUED] to={msg.address} id={msg_id} len={len(b64)}")
             return
 
         # fallback
@@ -233,7 +286,7 @@ class LoRaGateway:
     def _register_builtin_commands(self):
         self.commands.register("info", self._cmd_info, help="show module info")
 
-    def _cmd_info(self, _):
+    def _cmd_info(self, _, *args):
         return json.dumps({
             "uid": self.lora.UID,
             "version": self.lora.version,

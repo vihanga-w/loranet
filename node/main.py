@@ -1,3 +1,4 @@
+import base64
 from os import urandom
 import time
 from reyax_pi import RYLR998
@@ -88,7 +89,7 @@ def main():
                 if data.strip():
                     msg_id, resp, _ = lora.send_request(data.encode("utf-8"))
                     print(f"[TX] id={msg_id}")
-                    print(f"[RESP] id={msg_id} {resp.decode('utf-8', errors='ignore')}")
+                    print(f"[RESP] id={msg_id} {base64.b64decode(resp).decode()}")
 
             time.sleep(0.05)
 
