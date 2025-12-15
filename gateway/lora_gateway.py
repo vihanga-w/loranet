@@ -1,6 +1,6 @@
 import time
 import json
-from reyax_pi import RYLR998
+from reyax_pi import RYLR998, ReceivedMessage
 from commands_handler import CommandRegistry
 import config
 
@@ -32,6 +32,8 @@ class LoRaGateway:
 
         self.lora.output_power = config.OUTPUT_POWER
 
+        # TODO: Check and validate configuration and retry if necessary
+
     # RX Loop
 
     def start(self):
@@ -50,11 +52,45 @@ class LoRaGateway:
 
     # Packet handling
 
-    def handle_rx(self, msg):
-        if not msg.data:
+    def handle_rx(self, msg: ReceivedMessage):
+        # No data or invalid address
+        if not msg.data or msg.address is None:
             return
 
         raw = msg.data.decode("ascii", errors="ignore")
+
+        # Discovery frame (DISC|<nonce>|<slots>|<slots_ms>)
+        if raw.startswith("DISC|"):
+            parts = raw.split("|", 3)
+
+            if len(parts) != 4:
+                return
+
+            _, nonce, slots, slots_ms = parts
+
+            gw_hash = hash((self.lora.networkid, self.lora.address, nonce))
+
+            slot_number = gw_hash % int(slots)
+            response_delay_ms = slot_number * int(slots_ms)
+
+            # Incorporate some jitter to reduce impact of collisions
+            jitter_ms = (gw_hash % 10) - 5  # +/-5ms
+            
+            # Invert jitter such that delay + jitter is always within slot time
+            if response_delay_ms + jitter_ms > int(slots) * int(slots_ms):
+                jitter_ms = -jitter_ms
+            
+            response_delay_ms += jitter_ms
+
+            print(f"[DISC] from={msg.address} nonce={nonce} slot={slot_number} delay={response_delay_ms}ms")
+
+            response = f"GWD|{nonce}"
+            self.lora.send(msg.address, response.encode("ascii"))
+
+            print(f"[DISC] from={msg.address} nonce={nonce} slots={slots} slots_ms={slots_ms}")
+            print(f"[DISC-R] to={msg.address} resp={response}")
+
+            return
 
         # Reliable DATA frame
         if raw.startswith("D|"):

@@ -1,3 +1,4 @@
+from os import urandom
 import time
 from reyax_pi import RYLR998
 from random import randint
@@ -16,7 +17,6 @@ GATEWAY_ADDR = 1                # gateway address (fixed at 1)
 
 RF_PARAMETERS = (9, 7, 1, 12)
 OUTPUT_POWER = 22
-
 
 def main():
     print("Starting LoRa node...")
@@ -44,12 +44,17 @@ def main():
 
     lora.output_power = OUTPUT_POWER
 
+    # TODO: Check and validate configuration and retry if necessary
+
     # Info
     print("UID:", lora.UID)
     print("Version:", lora.version)
     print("Address:", lora.address)
     print("RF:", lora.rf_parameters)
     print("Power:", lora.output_power)
+
+    # Discover gateways
+    lora.discover_gw()
 
     print("Node ready")
     print("Type messages to send, Ctrl+C to exit\n")
@@ -74,7 +79,7 @@ def main():
             if input_available():
                 data = input("> ")
                 if data.strip():
-                    msg_id, resp = lora.send_request(GATEWAY_ADDR, data.encode("utf-8"))
+                    msg_id, resp = lora.send_request(data.encode("utf-8"))
                     print(f"[TX] id={msg_id}")
                     print(f"[RESP] id={msg_id} {resp.decode('utf-8', errors='ignore')}")
 

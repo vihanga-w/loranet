@@ -39,6 +39,25 @@ class ReceivedMessage:
             "SNR": self.SNR
         })
 
+class Node():
+    def __init__(self, address: int, rssi: int, snr: int):
+        self.address = address
+        self.rssi = rssi
+        self.snr = snr
+
+    @property
+    def quality(self) -> float:
+        SNR_MIN = -12.5
+
+        # Link margin dominates
+        margin = self.snr - SNR_MIN
+
+        # Normalize RSSI
+        rssi_score = max(0.0, min(1.0, (self.rssi + 130) / 60))
+
+        # Weighted quality score
+        return (margin * 1.0) + (rssi_score * 5.0)
+    
 class RYLR998:
     def __init__(self, port="/dev/serial0", baudrate=115200, timeout=0.1):
         self._uart = serial.Serial(
@@ -50,6 +69,7 @@ class RYLR998:
         self._uart.reset_input_buffer()
         self._rxbuf = b""
         self._lock = threading.RLock()
+        self.links = []
 
     # Basic Info
 
@@ -82,7 +102,7 @@ class RYLR998:
         if value not in valid:
             raise ValueError(f"Invalid network ID {value}")
         r = self._command_response(f"AT+NETWORKID={value}\r\n".encode())
-        if r != b"+OK\r\n":
+        if not self._is_ok(r):
             raise Exception(r)
 
     # Address
@@ -95,7 +115,7 @@ class RYLR998:
     @address.setter
     def address(self, value: int) -> None:
         r = self._command_response(f"AT+ADDRESS={value}\r\n".encode())
-        if r != b"+OK\r\n":
+        if not self._is_ok(r):
             raise Exception(r)
 
     # RF
@@ -110,7 +130,7 @@ class RYLR998:
     def rf_parameters(self, value):
         s = ",".join(map(str, value))
         r = self._command_response(f"AT+PARAMETER={s}\r\n".encode())
-        if r != b"+OK\r\n":
+        if not self._is_ok(r):
             raise Exception(r)
 
     @property
@@ -121,10 +141,18 @@ class RYLR998:
     @output_power.setter
     def output_power(self, value: int) -> None:
         r = self._command_response(f"AT+CRFOP={value}\r\n".encode())
-        if r != b"+OK\r\n":
+        if not self._is_ok(r):
             raise Exception(r)
 
     # TX/RX
+
+    def pick_ideal_gw(self) -> int:
+        if not self.links:
+            raise Exception("No known gateways")
+
+        best_link = max(self.links, key=lambda link: link.quality)
+        
+        return best_link.address
 
     def send(self, address: int, data: bytes) -> None:
         if len(data) > 240:
@@ -141,7 +169,6 @@ class RYLR998:
 
     def send_request(
         self,
-        address: int,
         payload: bytes,
         *,
         retries: int = 5,
@@ -157,6 +184,7 @@ class RYLR998:
         Returns: (msg_id, response_bytes)
         """
         msg_id = self._new_msg_id()
+        address = self.pick_ideal_gw()
 
         body = payload.decode("latin-1", errors="ignore")
         frame = f"D|{msg_id}|{body}".encode("ascii", errors="ignore")
@@ -213,6 +241,59 @@ class RYLR998:
             msg.parse(frame)
             
             return msg
+    
+    def discover_gw(self):
+        while True:
+            disc_nonce = os.urandom(4).hex()
+
+            discovered_gateways = []
+            slots = 125
+            slots_ms = 30
+            max_wait = ((slots * slots_ms) / 1000) + 2
+
+            print("Discovering gateways, this will take", max_wait, "seconds...")
+
+            self.send(0, f"DISC|{disc_nonce}|{slots}|{slots_ms}".encode("ascii"))
+
+            start_time = time.time()
+
+            try:
+                while True:
+                    if time.time() - start_time > max_wait:
+                        break
+
+                    msg = self.receive()
+
+                    # Ignore invalid responses
+                    if not msg or not msg.data or not msg.address or not msg.RSSI or not msg.SNR:
+                        time.sleep(0.01)
+                        continue
+
+                    if msg and msg.data:
+                        t = msg.data.decode("ascii", errors="ignore")
+
+                        if t.startswith("GWD|"):
+                            _, nonce = t.split("|", 1)
+
+                            if nonce == disc_nonce:
+                                link = Node(msg.address, msg.RSSI, msg.SNR)
+
+                                discovered_gateways.append(link)
+
+                                print(f"Discovered gateway at address {link.address} with RSSI {link.rssi} dBm, SNR {link.snr}, quality {link.quality:.1f}")
+                
+                if len(discovered_gateways) == 0:
+                    print("No gateways found, rescanning...")
+                    continue
+
+                self.links = discovered_gateways
+
+                print("Discovery complete. Found", len(discovered_gateways))
+
+                break
+            except KeyboardInterrupt:
+                print("Discovery interrupted")
+                return
 
     # Internal methods
 
@@ -258,6 +339,10 @@ class RYLR998:
     def _new_msg_id(self) -> str:
         # 4 bytes -> 8 hex chars, short but good enough for testing
         return os.urandom(4).hex()
+    
+    def _is_ok(self, r: bytes) -> bool:
+        # tolerate '+OK\r', '+OK\r\n', 'OK\r\n', etc.
+        return r.strip() in (b"+OK", b"OK")
 
     def send_reliable(
         self,

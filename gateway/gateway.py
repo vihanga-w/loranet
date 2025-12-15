@@ -11,6 +11,7 @@ def main():
     print("Gateway ready")
     print("UID:", gw.lora.UID)
     print("RF:", gw.lora.rf_parameters)
+    print("Address:", gw.lora.address)
 
     print("Registering commands...")
 
