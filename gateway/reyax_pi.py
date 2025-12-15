@@ -316,17 +316,37 @@ class RYLR998:
 
             msg = ReceivedMessage()
             msg.parse(frame)
+
+            # Update the signal data for gw
+            self.update_link_quality(msg)
+
             return msg
+    
+    def update_link_quality(self, msg: ReceivedMessage, link_override: Node | None = None):
+        link: Node | None = None
+
+        if link_override is None:
+            for l in self._links:
+                if l.address != msg.address:
+                    continue
+
+                link = l
+                break
+        else:
+            link = link_override
+
+        # no-op if link was not found or provided
+        if not link:
+            return
+
+        # Update signal quality info
+        link.rssi = msg.RSSI if msg.RSSI is not None else link.rssi
+        link.snr = msg.SNR if msg.SNR is not None else link.snr
     
     def refresh_link_quality(self):
         for link in self._links:
             _, _, msg = self.send_request(b"ping", address_override=link.address)
-
-            # Update signal quality info
-            link.rssi = msg.RSSI if msg.RSSI is not None else link.rssi
-            link.snr = msg.SNR if msg.SNR is not None else link.snr
-
-            print(f"Link to {link.address}: RSSI={link.rssi} dBm, SNR={link.snr}, quality={link.quality:.1f}")
+            self.update_link_quality(msg, link)
 
     def poll(self):
         self.fulfill_pending_messages()
