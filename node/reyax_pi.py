@@ -56,7 +56,7 @@ class Node():
         rssi_score = 1.0 / (1.0 + math.exp(-(self.rssi + 80) / 10.0))
 
         # Weighted quality score
-        return (margin * 1.0) + (rssi_score * 5.0)
+        return margin + (rssi_score * 5.0)
     
 class RYLR998:
     def __init__(self, port="/dev/serial0", baudrate=115200, timeout=0.1):
