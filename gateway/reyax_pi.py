@@ -174,6 +174,7 @@ class RYLR998:
         retries: int = 5,
         timeout_s: float = 2.0,
         backoff_s: float = 0.2,
+        address_override: int | None = None,
     ):
         """
         Reliable request/response:
@@ -184,7 +185,7 @@ class RYLR998:
         Returns: (msg_id, response_bytes)
         """
         msg_id = self._new_msg_id()
-        address = self.pick_ideal_gw()
+        address = address_override if address_override is not None else self.pick_ideal_gw()
 
         body = payload.decode("latin-1", errors="ignore")
         frame = f"D|{msg_id}|{body}".encode("ascii", errors="ignore")
@@ -215,7 +216,7 @@ class RYLR998:
                         if rid == msg_id:
                             # ACK response so gateway can stop retrying
                             self.send(address, f"AR|{msg_id}".encode("ascii"))
-                            return msg_id, resp.encode("latin-1", errors="ignore")
+                            return msg_id, resp.encode("latin-1", errors="ignore"), msg
 
             # retry with backoff
             time.sleep(backoff_s * (attempt + 1))
@@ -242,6 +243,16 @@ class RYLR998:
             
             return msg
     
+    def refresh_link_quality(self):
+        for link in self.links:
+            _, _, msg = self.send_request(b"PING", address_override=link.address)
+
+            # Update signal quality info
+            link.rssi = msg.RSSI if msg.RSSI is not None else link.rssi
+            link.snr = msg.SNR if msg.SNR is not None else link.snr
+
+            print(f"Link to {link.address}: RSSI={link.rssi} dBm, SNR={link.snr}, quality={link.quality:.1f}")
+
     def discover_gw(self):
         while True:
             disc_nonce = os.urandom(4).hex()
