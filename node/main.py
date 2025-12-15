@@ -65,7 +65,7 @@ def main():
 
                 if t.startswith("R|"):
                     _, msg_id, payload = t.split("|", 2)
-                    print(f"[RESP] id={msg_id} {payload}")
+                    # print(f"[RESP] id={msg_id} {payload}")
 
                     # ACK the response
                     lora.send(GATEWAY_ADDR, f"AR|{msg_id}".encode("ascii"))
