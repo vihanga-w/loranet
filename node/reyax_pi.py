@@ -320,7 +320,7 @@ class RYLR998:
     
     def refresh_link_quality(self):
         for link in self._links:
-            _, _, msg = self.send_request(b"PING", address_override=link.address)
+            _, _, msg = self.send_request(b"ping", address_override=link.address)
 
             # Update signal quality info
             link.rssi = msg.RSSI if msg.RSSI is not None else link.rssi
