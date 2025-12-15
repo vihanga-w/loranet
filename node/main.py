@@ -61,7 +61,14 @@ def main():
 
     # Main loop
     try:
+        i = time.time()
+
         while True:
+            # Periodically refresh gateway signal quality info
+            if time.time() - i >= 30:
+                lora.refresh_link_quality()
+                i = time.time()
+
             # Check for incoming messages
             msg = lora.receive()
 
@@ -79,7 +86,7 @@ def main():
             if input_available():
                 data = input("> ")
                 if data.strip():
-                    msg_id, resp = lora.send_request(data.encode("utf-8"))
+                    msg_id, resp, _ = lora.send_request(data.encode("utf-8"))
                     print(f"[TX] id={msg_id}")
                     print(f"[RESP] id={msg_id} {resp.decode('utf-8', errors='ignore')}")
 

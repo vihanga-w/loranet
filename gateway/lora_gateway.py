@@ -128,20 +128,23 @@ class LoRaGateway:
 
         print(f"[RX] from={msg.address} data={msg.data}")
 
-    def send_response_reliable(self, addr, msg_id, payload, retries=5, timeout_s=1.0):
+    def send_response_reliable(self, addr, msg_id, payload, retries=15, timeout_s=0.25):
         frame = f"R|{msg_id}|{payload}".encode("ascii", errors="ignore")
 
         for attempt in range(retries):
             self.lora.send(addr, frame)
 
             deadline = time.monotonic() + timeout_s
+
             while time.monotonic() < deadline:
                 msg = self.lora.receive()
+
                 if not msg or not msg.data:
                     time.sleep(0.01)
                     continue
 
                 t = msg.data.decode("ascii", errors="ignore")
+
                 if t == f"AR|{msg_id}":
                     print(f"[RESP-ACK] from={addr} id={msg_id}")
                     return
