@@ -75,12 +75,12 @@ def main():
             if msg and msg.data:
                 t = msg.data.decode("ascii", errors="ignore")
 
-                if t.startswith("R|"):
+                if t.startswith("R|")and msg.address is not None:
                     _, msg_id, payload = t.split("|", 2)
                     # print(f"[RESP] id={msg_id} {payload}")
 
                     # ACK the response
-                    lora.send(GATEWAY_ADDR, f"AR|{msg_id}".encode("ascii"))
+                    lora.send_now(msg.address, f"AR|{msg_id}".encode("ascii"))
 
             # Non-blocking send
             if input_available():
