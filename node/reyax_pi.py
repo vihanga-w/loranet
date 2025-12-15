@@ -1,3 +1,4 @@
+import math
 import serial
 import time
 import threading
@@ -52,8 +53,7 @@ class Node():
         # Link margin dominates
         margin = self.snr - SNR_MIN
 
-        # Normalize RSSI
-        rssi_score = max(0.0, min(1.0, (self.rssi + 130) / 60))
+        rssi_score = 1.0 / (1.0 + math.exp(-(self.rssi + 80) / 10.0))
 
         # Weighted quality score
         return (margin * 1.0) + (rssi_score * 5.0)
