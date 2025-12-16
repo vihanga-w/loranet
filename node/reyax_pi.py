@@ -10,6 +10,57 @@ import threading
 import os
 import time
 
+def lora_time_on_air(
+    payload_len: int,
+    sf: int,
+    bw: int,
+    cr: int,
+    preamble_len: int = 8,
+    explicit_header: bool = True,
+    crc_on: bool = True,
+    low_datarate_opt: bool = False,
+) -> float:
+    """
+    Returns Time-on-Air in seconds
+    """
+
+    BW_MAP = {7: 125_000, 8: 250_000, 9: 500_000}
+
+    bw = BW_MAP[bw]
+
+    # Symbol duration
+    tsym = (2 ** sf) / bw
+
+    # Flags
+    DE = 1 if low_datarate_opt else 0
+    IH = 0 if explicit_header else 1
+    CRC = 1 if crc_on else 0
+
+    # Payload symbols
+    payload_symb_nb = (
+        8
+        + max(
+            math.ceil(
+                (
+                    8 * payload_len
+                    - 4 * sf
+                    + 28
+                    + 16 * CRC
+                    - 20 * IH
+                )
+                / (4 * (sf - 2 * DE))
+            )
+            * (cr + 4),
+            0,
+        )
+    )
+
+    # Durations
+    tpreamble = (preamble_len + 4.25) * tsym
+    tpayload = payload_symb_nb * tsym
+
+    return tpreamble + tpayload
+
 class ReceivedMessage:
     def __init__(self) -> None:
         self.address: int | None = None
@@ -102,6 +153,7 @@ class RYLR998:
         self._links: list[Node] = []
         self._pending_messages: list[PendingMessage] = []
         self._chunked_messages: dict[str, ChunkedMessage] = {}
+        self._cached_rf_params: tuple[int, ...] | None = None
 
     # Basic Info
 
@@ -175,6 +227,12 @@ class RYLR998:
         r = self._command_response(f"AT+CRFOP={value}\r\n".encode())
         if not self._is_ok(r):
             raise Exception(r)
+    
+    def cached_rf_params(self):
+        if not self._cached_rf_params:
+            self._cached_rf_params = self.rf_parameters
+        
+        return self._cached_rf_params
 
     # TX/RX
 
@@ -271,8 +329,6 @@ class RYLR998:
                 self.fulfill_pending_messages()
                 time.sleep(0.005)
             
-            chunked_warn = False
-            
             def process(t: str):
                 parts = t.split("|")
 
@@ -316,8 +372,16 @@ class RYLR998:
             deadline1 = time.monotonic() + ack_timeout_s
             while time.monotonic() < deadline1:
                 self.fulfill_pending_messages()
-                msg = self.receive()
-                if not msg or not msg.data:
+
+                read_err = False
+                msg: ReceivedMessage | None = None
+
+                try:
+                    msg = self.receive()
+                except:
+                    read_err = True
+
+                if read_err or not msg or not msg.data:
                     time.sleep(0.01)
                     continue
 
@@ -347,8 +411,16 @@ class RYLR998:
                 deadline2 = time.monotonic() + resp_timeout_s
                 while time.monotonic() < deadline2:
                     self.fulfill_pending_messages()
-                    msg = self.receive()
-                    if not msg or not msg.data:
+                    
+                    read_err = False
+                    msg: ReceivedMessage | None = None
+
+                    try:
+                        msg = self.receive()
+                    except:
+                        read_err = True
+
+                    if read_err or not msg or not msg.data:
                         time.sleep(0.01)
                         continue
 
@@ -677,6 +749,11 @@ class RYLR998:
                 raise Exception(r)
 
             sent = True
+
+            rf = self.cached_rf_params()
+
+            time.sleep(lora_time_on_air(len(data), rf[0], rf[1], rf[2], rf[3]))
+            # print(rf)
 
 class PendingMessage:
     def __init__(

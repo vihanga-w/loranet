@@ -10,13 +10,13 @@ BAUDRATE = 115200
 
 # Must match gateway
 # BAND = 868000000
-NETWORK_ID = 12
+NETWORK_ID = 18
 ADDRESS = randint(2, 65535)     # unique node address
 
 # TODO: Scan for gateways and store list of gateways + sort by best RSSI
 GATEWAY_ADDR = 1                # gateway address (fixed at 1)
 
-RF_PARAMETERS = (9, 7, 1, 12)
+RF_PARAMETERS = (7, 8, 1, 12)
 OUTPUT_POWER = 22
 
 def main():

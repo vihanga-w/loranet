@@ -27,7 +27,6 @@ class PendingResp:
     max_attempts: int = 12
     retry_interval_s: float = 0.5
 
-
 class LoRaGateway:
     def __init__(self):
         self.lora = RYLR998(config.SERIAL_PORT, config.BAUDRATE)
@@ -181,7 +180,7 @@ class LoRaGateway:
                                 print(f"[RESP-ACK] from={m.address} id={pr.msg_id}")
                                 done.append(pr.msg_id)
                                 break
-                        time.sleep(0.01)
+                        time.sleep(0.005)
                     
                 pr.attempts += 1
                 pr.next_send_at = now + pr.retry_interval_s
