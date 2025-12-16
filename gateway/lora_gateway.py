@@ -39,6 +39,9 @@ class LoRaGateway:
         # Non-blocking reliable responses
         self._pending_resps: dict[str, PendingResp] = {}
 
+        self._pending_cursor = 0
+        self._last_pending_addr: int | None = None
+
         self._register_builtin_commands()
 
     # Init
@@ -66,6 +69,7 @@ class LoRaGateway:
             msg = self.lora.receive()
             if msg:
                 try:
+                    print("handle_rx")
                     self.handle_rx(msg)
                 except Exception as e:
                     print(f"[ERR] handle_rx: {e!r}")
@@ -87,19 +91,40 @@ class LoRaGateway:
         send_at = time.monotonic() + (delay_ms / 1000.0)
         self._txq.append(ScheduledTx(send_at=send_at, addr=addr, payload=payload))
 
-    def _tick_tx_queue(self):
-        now = time.monotonic()
+    def _tick_tx_queue(self) -> None:
         if not self._txq:
             return
 
-        remaining: list[ScheduledTx] = []
-        for item in self._txq:
-            if item.send_at <= now:
-                self.lora.send_now(item.addr, item.payload)
-            else:
-                remaining.append(item)
+        # GWDs first, then by send_at
+        self._txq.sort(key=lambda x: (not x.payload.startswith(b"GWD"), x.send_at))
 
-        self._txq = remaining
+        iterations = sum(1 for item in self._txq if item.payload.startswith(b"GWD"))
+        iterations = iterations + 1 if iterations > 0 else 1
+
+        for _ in range(iterations):
+            if not self._txq:
+                break
+
+            item = self._txq[0]
+            now = time.monotonic()
+
+            # Wait until this item is due (for GWD only)
+            if item.send_at > now:
+                if item.payload.startswith(b"GWD"):
+                    sleep_s = item.send_at - now
+                    # safety clamp (optional)
+                    if sleep_s > 0:
+                        time.sleep(sleep_s)
+                else:
+                    continue
+
+            try:
+                self.lora.send_now(item.addr, item.payload)
+                self._txq.pop(0)
+            except Exception as e:
+                print("[TTXQ] Failed to send item from queue:", e)
+                item.send_at = time.monotonic() + 0.25
+                break
 
     def _queue_reliable_response(self, addr: int, msg_id: str, payload_text: str):
         frame = f"R|{msg_id}|{payload_text}".encode("ascii", errors="ignore")
@@ -153,38 +178,78 @@ class LoRaGateway:
             retry_interval_s=0.5,
         )
 
-    def _tick_pending_responses(self):
-        now = time.monotonic()
+    def _tick_pending_responses(self) -> None:
         if not self._pending_resps:
             return
 
-        done = []
-        for msg_id, pr in self._pending_resps.items():
-            if pr.attempts >= pr.max_attempts:
-                print(f"[RESP-FAIL] id={msg_id}")
-                done.append(msg_id)
-                continue
+        now = time.monotonic()
 
-            if now >= pr.next_send_at:
+        MAX_SENDS_PER_TICK = 1
+
+        keys = list(self._pending_resps.keys())
+        n = len(keys)
+        if n == 0:
+            return
+
+        done: list[str] = []
+        sent = 0
+
+        start = self._pending_cursor % n
+
+        def _try_pick(avoid_addr: int | None) -> tuple[int, str, PendingResp] | None:
+            idx = start
+
+            for _ in range(n):
+                msg_id = keys[idx]
+                pr = self._pending_resps.get(msg_id)
+                if pr is None:
+                    idx = (idx + 1) % n
+                    continue
+
+                if pr.attempts >= pr.max_attempts:
+                    print(f"[RESP-FAIL] id={msg_id}")
+                    done.append(msg_id)
+                    idx = (idx + 1) % n
+                    continue
+
+                if now < pr.next_send_at:
+                    idx = (idx + 1) % n
+                    continue
+
+                if avoid_addr is not None and pr.addr == avoid_addr:
+                    idx = (idx + 1) % n
+                    continue
+
+                return idx, msg_id, pr
+
+                # idx advance handled above
+            return None
+
+        # Pass 1: avoid repeating the last address
+        picked = _try_pick(self._last_pending_addr)
+        
+        # Pass 2: if we couldn't, allow same address
+        if picked is None:
+            picked = _try_pick(None)
+
+        if picked is not None and sent < MAX_SENDS_PER_TICK:
+            idx, msg_id, pr = picked
+            try:
                 self.lora.send_now(pr.addr, pr.frame)
-
-                with self.lora._lock:
-                    # quick RX poll burst (listen for node's ACK)
-                    t_end = time.monotonic() + 0.25
-                    while time.monotonic() < t_end:
-                        m = self.lora.receive()
-                        if m and m.data:
-                            raw = m.data.decode("ascii", errors="ignore")
-                            print(raw)
-                            if raw == f"AR|{pr.msg_id}":
-                                print(f"[RESP-ACK] from={m.address} id={pr.msg_id}")
-                                done.append(pr.msg_id)
-                                break
-                        time.sleep(0.005)
-                    
                 pr.attempts += 1
-                pr.next_send_at = now + pr.retry_interval_s
+                pr.next_send_at = time.monotonic() + pr.retry_interval_s
                 print(f"[RESP-TX] id={msg_id} attempt={pr.attempts}")
+                sent += 1
+                self._last_pending_addr = pr.addr
+            except Exception as e:
+                print("[TPR] Send now error:", e)
+                pr.next_send_at = time.monotonic() + 0.25
+
+            # move cursor to the next position after the one we considered
+            self._pending_cursor = (idx + 1) % n
+        else:
+            # nothing due; just advance cursor a bit to avoid bias
+            self._pending_cursor = (start + 1) % n
 
         for msg_id in done:
             self._pending_resps.pop(msg_id, None)
@@ -202,22 +267,14 @@ class LoRaGateway:
 
         # clamp to >= 0
         return max(0, delay)
-
-    def handle_rx(self, msg: ReceivedMessage):
+    
+    def _handle_disc(self, msg: ReceivedMessage):
         if not msg.data or msg.address is None:
             return
-
+        
         raw = msg.data.decode("ascii", errors="ignore")
-
-        # 1) Response ACK from node: AR|<msg_id>
-        if raw.startswith("AR|"):
-            acked_id = raw[3:].strip()
-            if acked_id in self._pending_resps:
-                print(f"[RESP-ACK] from={msg.address} id={acked_id}")
-                self._pending_resps.pop(acked_id, None)
-            return
-
-        # 2) Discovery: DISC|<nonce>|<slots>|<slots_ms>
+        
+        # Discovery: DISC|<nonce>|<slots>|<slots_ms>
         if raw.startswith("DISC|"):
             parts = raw.split("|", 3)
             if len(parts) != 4:
@@ -237,7 +294,13 @@ class LoRaGateway:
             print(f"[DISC] from={msg.address} nonce={nonce} delay={delay_ms}ms")
             return
 
-        # 3) Reliable request: D|<msg_id>|<payload>
+    def _handle_exec(self, msg: ReceivedMessage):
+        if not msg.data or msg.address is None:
+            return
+        
+        raw = msg.data.decode("ascii", errors="ignore")
+        
+        # Reliable request: D|<msg_id>|<payload>
         if raw.startswith("D|"):
             parts = raw.split("|", 2)
             if len(parts) != 3:
@@ -276,6 +339,26 @@ class LoRaGateway:
             self._queue_reliable_response(msg.address, msg_id, b64)
             print(f"[RESP-QUEUED] to={msg.address} id={msg_id} len={len(b64)}")
             return
+
+    def handle_rx(self, msg: ReceivedMessage):
+        if not msg.data or msg.address is None:
+            return
+
+        raw = msg.data.decode("ascii", errors="ignore")
+
+        # 1) Response ACK from node: AR|<msg_id>
+        if raw.startswith("AR|"):
+            acked_id = raw[3:].strip()
+            if acked_id in self._pending_resps:
+                print(f"[RESP-ACK] from={msg.address} id={acked_id}")
+                self._pending_resps.pop(acked_id, None)
+            return
+
+        # 2) Discovery: DISC|<nonce>|<slots>|<slots_ms>
+        self._handle_disc(msg)
+
+        # 3) Reliable request: D|<msg_id>|<payload>
+        self._handle_exec(msg)
 
         # fallback
         print(f"[RX] from={msg.address} data={msg.data!r}")

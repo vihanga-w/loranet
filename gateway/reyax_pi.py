@@ -154,6 +154,8 @@ class RYLR998:
         self._pending_messages: list[PendingMessage] = []
         self._chunked_messages: dict[str, ChunkedMessage] = {}
         self._cached_rf_params: tuple[int, ...] | None = None
+        self._cached_netid: int | None = None
+        self._cached_addr: int | None = None
 
     # Basic Info
 
@@ -175,10 +177,18 @@ class RYLR998:
 
     @property
     def networkid(self) -> int:
+        if self._cached_netid:
+            return self._cached_netid
+        
         r = self._command_response(b"AT+NETWORKID?\r\n")
         if b"+NETWORKID=" not in r:
             raise Exception(f"Bad response: {r}")
-        return int(r[11:].decode())
+        
+        id = int(r[11:].decode())
+
+        self._cached_netid = id
+
+        return id
 
     @networkid.setter
     def networkid(self, value: int) -> None:
@@ -193,8 +203,16 @@ class RYLR998:
 
     @property
     def address(self) -> int:
+        if self._cached_addr:
+            return self._cached_addr
+        
         r = self._command_response(b"AT+ADDRESS?\r\n")
-        return int(r[9:].decode())
+        
+        addr = int(r[9:].decode())
+
+        self._cached_addr = addr
+        
+        return addr
 
     @address.setter
     def address(self, value: int) -> None:
@@ -206,9 +224,17 @@ class RYLR998:
 
     @property
     def rf_parameters(self):
+        if self._cached_rf_params:
+            return self._cached_rf_params
+        
         r = self._command_response(b"AT+PARAMETER?\r\n")
         params = r[11:].decode().strip().split(",")
-        return tuple(map(int, params))
+        
+        rf = tuple(map(int, params))
+
+        self._cached_rf_params = rf
+
+        return rf
 
     @rf_parameters.setter
     def rf_parameters(self, value):
@@ -227,12 +253,6 @@ class RYLR998:
         r = self._command_response(f"AT+CRFOP={value}\r\n".encode())
         if not self._is_ok(r):
             raise Exception(r)
-    
-    def cached_rf_params(self):
-        if not self._cached_rf_params:
-            self._cached_rf_params = self.rf_parameters
-        
-        return self._cached_rf_params
 
     # TX/RX
 
@@ -720,40 +740,40 @@ class RYLR998:
         return False
 
     def send_now(self, address: int, data: bytes) -> None:
-        sent = False
+        with self._lock:
+            sent = False
 
-        while not sent:
-            if len(data) > 240:
-                raise ValueError("Payload too large")
+            while not sent:
+                if len(data) > 240:
+                    raise ValueError("Payload too large")
 
-            cmd = (
-                b"AT+SEND="
-                + str(address).encode()
-                + b","
-                + str(len(data)).encode()
-                + b","
-                + data
-                + b"\r\n"
-            )
+                cmd = (
+                    b"AT+SEND="
+                    + str(address).encode()
+                    + b","
+                    + str(len(data)).encode()
+                    + b","
+                    + data
+                    + b"\r\n"
+                )
 
-            r = self._command_response(cmd, 8.0)
-            
-            if b"OK" not in r:
-                # Reset the module and try again
-                if b"ERR=17" in r:
-                    print("[SENDNOW] Encountered ERR 17 while sending a message: Last TX was not completed")
-                    print("[SENDNOW] Attempting to recover by soft resetting the module")
-                    
-                    self.reset()
+                r = self._command_response(cmd, 8.0)
+                
+                if b"OK" not in r:
+                    # Reset the module and try again
+                    if b"ERR=17" in r:
+                        print("[SENDNOW] Encountered ERR 17 while sending a message: Last TX was not completed")
+                        print("[SENDNOW] Attempting to recover by soft resetting the module")
+                        
+                        self.reset()
 
-                raise Exception(r)
+                    raise Exception(r)
 
-            sent = True
+                sent = True
 
-            rf = self.cached_rf_params()
+        rf = self.rf_parameters
 
-            time.sleep(lora_time_on_air(len(data), rf[0], rf[1], rf[2], rf[3]))
-            # print(rf)
+        time.sleep(lora_time_on_air(len(data), rf[0], rf[1], rf[2], rf[3]))
 
 class PendingMessage:
     def __init__(
