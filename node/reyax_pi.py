@@ -516,6 +516,33 @@ class RYLR998:
 
     # Internal methods
 
+    def reset(self, timeout: float = 20.0) -> None:
+        """
+        Perform a software reset on the RYLR998.
+        Expects:
+            +RESET
+            +READY
+        """
+        r = self._command_response(b"AT+RESET\r\n")
+
+        # Some firmwares return both lines concatenated,
+        # others return only the first and emit +READY later
+        if b"+RESET" not in r:
+            raise Exception(f"Unexpected reset response: {r!r}")
+
+        # Wait explicitly for +READY
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            msg = self.receive()
+            if not msg or not msg.data:
+                time.sleep(0.01)
+                continue
+
+            if b"+READY" in msg.data:
+                return
+
+        raise TimeoutError("RYLR998 reset timed out waiting for +READY")
+
     def _collect_rx(self):
         # read everything currently available
         n = self._uart.in_waiting
@@ -621,22 +648,35 @@ class RYLR998:
         return False
 
     def send_now(self, address: int, data: bytes) -> None:
-        if len(data) > 240:
-            raise ValueError("Payload too large")
+        sent = False
 
-        cmd = (
-            b"AT+SEND="
-            + str(address).encode()
-            + b","
-            + str(len(data)).encode()
-            + b","
-            + data
-            + b"\r\n"
-        )
+        while not sent:
+            if len(data) > 240:
+                raise ValueError("Payload too large")
 
-        r = self._command_response(cmd, 8.0)
-        if b"OK" not in r:
-            raise Exception(r)
+            cmd = (
+                b"AT+SEND="
+                + str(address).encode()
+                + b","
+                + str(len(data)).encode()
+                + b","
+                + data
+                + b"\r\n"
+            )
+
+            r = self._command_response(cmd, 8.0)
+            
+            if b"OK" not in r:
+                # Reset the module and try again
+                if b"ERR=17" in r:
+                    print("[SENDNOW] Encountered ERR 17 while sending a message: Last TX was not completed")
+                    print("[SENDNOW] Attempting to recover by soft resetting the module")
+                    
+                    self.reset()
+
+                raise Exception(r)
+
+            sent = True
 
 class PendingMessage:
     def __init__(
